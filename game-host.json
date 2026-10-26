@@ -1,0 +1,19 @@
+{
+  "name": "myelin-neon-miner",
+  "port": 8886,
+  "runtimePort": 8786,
+  "games": [
+    {
+      "id": "neon-miner",
+      "webRoot": "dist/neon-miner",
+      "runtimePath": "/neon-miner",
+      "rooms": false,
+      "socket": false
+    }
+  ],
+  "runtimeCommand": [
+    "target/release/myelin-neon-miner"
+  ],
+  "manifest": "games/neon-miner/Cargo.toml",
+  "plugin": "./items.mjs"
+}
