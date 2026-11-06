@@ -1,7 +1,7 @@
 mod game;
 mod session;
 use serde_json::{json, Value};
-use session::{AnyResult, App};
+use session::{Actor, AnyResult, App};
 use std::io::Read;
 use std::{collections::HashMap, fs, path::PathBuf, time::Instant};
 use tiny_http::{Header, Method, Response, Server};
@@ -13,7 +13,12 @@ fn main() -> AnyResult<()> {
         if fs::metadata(path)?.len() > 32 * 1024 * 1024 {
             return Err("Export exceeds 32 MiB".into());
         }
-        println!("{}", serde_json::to_string_pretty(&session::verify_export(&serde_json::from_slice(&fs::read(path)?)?)?)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&session::verify_export(&serde_json::from_slice(
+                &fs::read(path)?
+            )?)?)?
+        );
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("simulate") {
@@ -33,7 +38,11 @@ fn main() -> AnyResult<()> {
         println!("{}", g.view());
         return Ok(());
     }
-    let port = std::env::var("PORT").ok().map(|s| s.parse::<u16>()).transpose()?.unwrap_or(game::PORT);
+    let port = std::env::var("PORT")
+        .ok()
+        .map(|s| s.parse::<u16>())
+        .transpose()?
+        .unwrap_or(game::PORT);
     let bind = std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into()));
     let token = std::env::var("RUNTIME_TOKEN").map_err(|_| "RUNTIME_TOKEN is required")?;
@@ -44,7 +53,10 @@ fn main() -> AnyResult<()> {
     let server = Server::http((bind.as_str(), port))?;
     println!("{} ready on {bind}:{port}", game::ID);
     for mut req in server.incoming_requests() {
-        let authorized = req.headers().iter().any(|h| h.field.equiv("X-Runtime-Token") && h.value.as_str() == token);
+        let authorized = req
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("X-Runtime-Token") && h.value.as_str() == token);
         if !authorized {
             let _ = req.respond(Response::from_string("Forbidden").with_status_code(403));
             continue;
@@ -55,7 +67,11 @@ fn main() -> AnyResult<()> {
             .find(|h| h.field.equiv("X-UTXOPlay-Account"))
             .map(|h| h.value.as_str().to_owned())
             .unwrap_or_default();
-        if account.len() != 64 || !account.bytes().all(|c| c.is_ascii_hexdigit()) {
+        if account.len() != 64
+            || !account
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
             let _ = req.respond(Response::from_string("Invalid account").with_status_code(400));
             continue;
         }
@@ -64,36 +80,58 @@ fn main() -> AnyResult<()> {
         let kind = match game::Kind::parse(parts.next().unwrap_or("")) {
             Ok(k) => k,
             Err(_) => {
-                let _ = req.respond(Response::from_string("Unknown arcade game").with_status_code(404));
+                let _ =
+                    req.respond(Response::from_string("Unknown arcade game").with_status_code(404));
                 continue;
             }
         };
         let path = format!("/{}", parts.next().unwrap_or(""));
-        let account = format!("{}-{}", account.to_ascii_lowercase(), kind.id());
+        let actor = Actor {
+            account: account.clone(),
+        };
+        let account = format!("{}-{}", account, kind.id());
         let result: AnyResult<Value> = (|| {
             sessions.retain(|_, (_, last)| last.elapsed().as_secs() < 120);
             if !sessions.contains_key(&account) {
                 if sessions.len() >= 6 {
-                    if let Some(oldest) = sessions.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
+                    if let Some(oldest) = sessions
+                        .iter()
+                        .min_by_key(|(_, (_, t))| *t)
+                        .map(|(k, _)| k.clone())
+                    {
                         sessions.remove(&oldest);
                     }
                 }
-                sessions.insert(account.clone(), (App::open(&dir.join(&account), kind)?, Instant::now()));
+                sessions.insert(
+                    account.clone(),
+                    (App::open(&dir.join(&account))?, Instant::now()),
+                );
             }
             let (app, last) = sessions.get_mut(&account).ok_or("Session unavailable")?;
             *last = Instant::now();
             match (req.method(), path.as_str()) {
-                (&Method::Get, "/api/state") => app.view(),
+                (&Method::Get, "/api/state") => app.state(),
                 (&Method::Get, "/api/export") => app.export(),
-                (&Method::Post, "/api/new") => app.new_game(),
                 (&Method::Post, "/api/replay") => app.replay(),
-                (&Method::Post, "/api/action") => {
+                (&Method::Get, p) if p.starts_with("/api/commands/") => {
+                    let (session, command) = p
+                        .trim_start_matches("/api/commands/")
+                        .split_once('/')
+                        .ok_or("Missing command scope")?;
+                    app.command(session, command)
+                }
+                (&Method::Post, "/api/action" | "/api/new") => {
                     let mut bytes = vec![];
                     std::io::Read::take(req.as_reader(), 4097).read_to_end(&mut bytes)?;
                     if bytes.len() > 4096 {
                         return Err("Request too large".into());
                     }
-                    app.action(serde_json::from_slice(&bytes)?)
+                    let body = serde_json::from_slice(&bytes)?;
+                    if path == "/api/new" {
+                        app.new_game(body, actor)
+                    } else {
+                        app.action(body, actor)
+                    }
                 }
                 _ => Err("Unknown endpoint".into()),
             }
@@ -102,7 +140,8 @@ fn main() -> AnyResult<()> {
             Ok(v) => (v, 200),
             Err(e) => (json!({"error":e.to_string()}), 400),
         };
-        let mut response = Response::from_data(serde_json::to_vec(&value)?).with_status_code(status);
+        let mut response =
+            Response::from_data(serde_json::to_vec(&value)?).with_status_code(status);
         response.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
         response.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
         let _ = req.respond(response);

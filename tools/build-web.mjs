@@ -1,5 +1,5 @@
 // Build a self-contained browser package for each configured game. Source paths
-// stay intact because native Myelin profiles commit to several source files.
+// remain independently publishable; native profiles pin the complete executable.
 import {cpSync,existsSync,mkdirSync,readFileSync,readdirSync,rmSync,writeFileSync} from 'node:fs';
 import path from 'node:path';
 const config=JSON.parse(readFileSync('game-host.json','utf8'));

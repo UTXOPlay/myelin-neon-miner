@@ -10,7 +10,8 @@ import {mineViewport,pointerInMine} from '../games/neon-miner/web/viewport.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const root=path.resolve(import.meta.dirname,'../dist/neon-miner');
 const output=path.resolve(process.env.CAPTURE_DIR||'artifacts/layout-review');mkdirSync(output,{recursive:true});
-let game=createGame(),actions=0;
+let game=createGame(),actions=0,session=1;const records=new Map(),account="01".repeat(32),profile="03".repeat(32);
+const current=()=>({game,session:{id:session.toString(16).padStart(64,"0"),profile,block_hash:actions.toString(16).padStart(64,"0"),actions}});
 const mime={'.html':'text/html','.mjs':'text/javascript','.js':'text/javascript','.json':'application/json','.css':'text/css','.webp':'image/webp','.png':'image/png','.svg':'image/svg+xml','.woff2':'font/woff2','.mp3':'audio/mpeg'};
 const server=createServer(async(req,res)=>{
  const url=new URL(req.url,'http://localhost'),prefix='/games/neon-miner/';
@@ -19,10 +20,19 @@ const server=createServer(async(req,res)=>{
  if(name.startsWith('api/')){
   let body='';for await(const c of req)body+=c;const request=body?JSON.parse(body):{};
   res.setHeader('Content-Type','application/json');
-  if(name==='api/guest'||name==='api/me'){res.end(JSON.stringify({user:{id:'layout-fixture',guest:true}}));return;}
-  if(name==='api/action'){apply(game,request.action);actions++;}
-  if(name==='api/new')game=createGame();
-  res.end(JSON.stringify({game,session:{id:'layout-fixture',block_hash:'0'.repeat(64),actions}}));return;
+  if(name==='api/guest'||name==='api/me'){res.end(JSON.stringify({user:{id:account,guest:true}}));return;}
+  if(name.startsWith('api/commands/')){res.end(JSON.stringify(records.get(name.split('/').at(-1))||{entry:null}));return;}
+  let command;
+  if(name==='api/action'||name==='api/new'){
+   command=records.get(request.command_id);
+   if(!command){
+    const intent={action:request.action,expected_cursor:request.expected_cursor,expected_block:request.expected_block,actor:{account}};
+    if(name==='api/action'){apply(game,request.action);actions++;}else{game=createGame();session++;actions=0;}
+    command={command_id:request.command_id,session_id:request.session_id,entry:{original:{identity:{id:Array.from(Buffer.from(request.command_id,'hex'))},scope:{session_id:Array.from(Buffer.from(request.session_id,'hex')),application_profile:Array.from(Buffer.from(request.profile,'hex'))},canonical_command:Array.from(Buffer.from(JSON.stringify(intent)))},status:{Committed:{outcome:{Succeeded:[]}}}}};
+    records.set(request.command_id,command);
+   }
+  }
+  res.end(JSON.stringify({...current(),...(command?{command}:{})}));return;
  }
  if(!name&&url.searchParams.has('level')){
   game=createGame();for(let level=1;level<Number(url.searchParams.get('level'));level++){game.mode='cleared';apply(game,{type:'next'});}

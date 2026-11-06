@@ -1,17 +1,19 @@
 use crate::game::{Game, Kind, ID, MAX_ACTIONS};
-use myelin_consensus::{
-    Authority, CommitteeSigner, ConsensusKind, ConsensusModuleDescriptor, FinalityProof, MyelinBlock, ProofOfAuthority,
-    ProofOfAuthorityConfig, SelectedConsensus,
-};
+use myelin_consensus::{Authority, CommitteeSigner, ConsensusConfig, ProofOfAuthorityConfig};
 use myelin_session::*;
+use myelin_session_authority::{AuthorityConfig, AuthorityKeys, AuthoritySigner, SessionAuthority};
+use myelin_session_journal::{application::*, *};
+use myelin_session_runtime::RegisteredFinalityVerifier;
 use myelin_session_store_rocksdb::RocksSessionStore;
+use secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 pub type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -19,351 +21,887 @@ fn hash(bytes: &[u8]) -> Hash32 {
     *blake3::hash(bytes).as_bytes()
 }
 fn random() -> AnyResult<Hash32> {
-    let mut b = [0; 32];
-    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
-    Ok(b)
+    let mut value = [0; 32];
+    getrandom::getrandom(&mut value).map_err(|e| e.to_string())?;
+    Ok(value)
+}
+fn parse_id(value: &str) -> AnyResult<Hash32> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return Err("Expected a canonical 32-byte lowercase hexadecimal identity".into());
+    }
+    Ok(hex::decode(value)?
+        .try_into()
+        .map_err(|_| "Invalid identity")?)
 }
 fn atomic(path: &Path, bytes: &[u8]) -> AnyResult<()> {
-    let mut f = tempfile::NamedTempFile::new_in(path.parent().ok_or("missing parent")?)?;
-    f.write_all(bytes)?;
-    f.as_file().sync_all()?;
-    f.persist(path)?;
+    let parent = path.parent().ok_or("Missing parent")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
     #[cfg(unix)]
-    fs::File::open(path.parent().unwrap())?.sync_all()?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
-#[derive(Clone)]
-struct Verifier(SelectedConsensus);
-impl FinalityVerifier for Verifier {
-    fn descriptor(&self) -> ConsensusModuleDescriptor {
-        self.0.module_descriptor()
-    }
-    fn verify(
-        &self,
-        block: &MyelinBlock,
-        proof: &FinalityProof,
-    ) -> std::result::Result<VerifiedFinality, myelin_consensus::ConsensusError> {
-        let f = self.0.finalise_with_proof(block.clone(), proof.clone())?;
-        Ok(VerifiedFinality { block_hash: f.block_hash, consensus_module_commitment: self.0.module_commitment() })
+#[cfg(test)]
+fn creation_fault(point: &str) {
+    if std::env::var("MINER_CREATION_FAULT").as_deref() == Ok(point) {
+        std::process::exit(86);
     }
 }
-fn verifier(public: [u8; 33]) -> AnyResult<Arc<Verifier>> {
-    Ok(Arc::new(Verifier(SelectedConsensus::ProofOfAuthority(ProofOfAuthority::new(ProofOfAuthorityConfig {
-        authorities: vec![Authority { id: ID.into(), public_key: public }],
-    })?))))
+fn artifact() -> AnyResult<Hash32> {
+    static DIGEST: OnceLock<Hash32> = OnceLock::new();
+    if let Some(value) = DIGEST.get() {
+        return Ok(*value);
+    }
+    let mut file = fs::File::open(std::env::current_exe()?)?;
+    let mut digest = blake3::Hasher::new();
+    let mut buf = [0; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    Ok(*DIGEST.get_or_init(|| *digest.finalize().as_bytes()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Actor {
+    pub account: String,
+}
+impl Actor {
+    pub fn validate(&self) -> AnyResult<()> {
+        parse_id(&self.account)?;
+        Ok(())
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Executor {
-    game: Game,
-    actions: u64,
+struct Intent {
+    action: Value,
+    expected_cursor: u64,
+    expected_block: String,
+    actor: Actor,
 }
-impl Executor {
-    fn new(kind: Kind) -> Self {
-        Self { game: Game::new(kind), actions: 0 }
-    }
-    fn restore(bytes: &[u8]) -> myelin_session::Result<Self> {
-        let e: Self = serde_json::from_slice(bytes).map_err(|e| SessionError::Execution(e.to_string()))?;
-        e.game.validate().map_err(SessionError::Execution)?;
-        if e.actions > MAX_ACTIONS {
-            return Err(SessionError::Execution("Action limit".into()));
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    command_id: String,
+    session_id: String,
+    profile: String,
+    action: Value,
+    expected_cursor: u64,
+    expected_block: String,
+}
+
+// The authenticated gateway attests account admission. This signature is
+// explicitly not a personal wallet signature. Original bytes survive retries.
+struct Auth(XOnlyPublicKey);
+impl CommandAuthenticator for Auth {
+    fn verify(&self, command: &OriginalCommand) -> std::result::Result<(), String> {
+        let intent: Intent =
+            serde_json::from_slice(&command.canonical_command).map_err(|e| e.to_string())?;
+        intent.actor.validate().map_err(|e| e.to_string())?;
+        parse_id(&intent.expected_block).map_err(|e| e.to_string())?;
+        if command.kind != InputKind::UserCommand
+            || command.authentication_context != self.0.serialize()
+            || command.identity.payload_hash != hash(&command.canonical_command)
+            || serde_json::to_vec(&intent).map_err(|e| e.to_string())? != command.canonical_command
+        {
+            return Err("Invalid canonical gateway command".into());
         }
-        Ok(e)
+        let signature = secp256k1::schnorr::Signature::from_slice(&command.authorization)
+            .map_err(|e| e.to_string())?;
+        Secp256k1::verification_only()
+            .verify_schnorr(
+                &signature,
+                &Message::from_digest(command.authorization_digest()),
+                &self.0,
+            )
+            .map_err(|e| e.to_string())
     }
 }
-impl TransitionExecutor for Executor {
-    fn state_root(&self) -> Hash32 {
-        hash(&self.snapshot().expect("serializable game"))
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Program {
+    game: Game,
+    actor: Option<String>,
+    next_session: Option<Hash32>,
+}
+impl Default for Program {
+    fn default() -> Self {
+        Self {
+            game: Game::new(Kind::NeonMiner),
+            actor: None,
+            next_session: None,
+        }
+    }
+}
+impl Program {
+    fn restore(bytes: &[u8]) -> std::result::Result<Self, String> {
+        let value: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        value.game.validate()?;
+        if let Some(actor) = &value.actor {
+            parse_id(actor).map_err(|e| e.to_string())?;
+        }
+        Ok(value)
+    }
+    fn act(
+        &mut self,
+        context: CommandContext,
+        intent: &Intent,
+        command: &OriginalCommand,
+    ) -> std::result::Result<(), String> {
+        let new_game = intent.action == json!({"type":"new_game"});
+        if self.next_session.is_some() {
+            return Err("Expedition is closed; resolve its original new-game command".into());
+        }
+        if intent.expected_cursor != context.input_position
+            || context.input_position > MAX_ACTIONS
+            || (!new_game && context.input_position == MAX_ACTIONS)
+        {
+            return Err("Stale command cursor or action limit".into());
+        }
+        if self
+            .actor
+            .as_ref()
+            .is_some_and(|id| id != &intent.actor.account)
+        {
+            return Err("Command actor differs from the admitted expedition owner".into());
+        }
+        self.actor = Some(intent.actor.account.clone());
+        if new_game {
+            self.next_session = Some(hash(
+                &[
+                    b"miner-new-session-v1".as_slice(),
+                    &command.authorization_digest(),
+                ]
+                .concat(),
+            ));
+            Ok(())
+        } else {
+            // A bounded 1..60 input tape is one command. Only Game::step
+            // advances 30 Hz physics; purchases/next/retry are ordered controls.
+            self.game.apply(&intent.action)
+        }
+    }
+}
+impl CommandProgram for Program {
+    fn clock(&self) -> ApplicationClock {
+        ApplicationClock::CommandSteps
     }
     fn snapshot(&self) -> std::result::Result<Vec<u8>, String> {
         serde_json::to_vec(self).map_err(|e| e.to_string())
     }
-    fn execute_block(
+    fn apply(
         &mut self,
-        height: u64,
-        frame: &FrameInput,
-        handoffs: &[SessionHandoff],
-        txs: &[Vec<u8>],
-    ) -> std::result::Result<ExecutionOutcome, String> {
-        if !txs.is_empty()
-            || !handoffs.is_empty()
-            || height != self.actions
-            || frame.start_position != self.actions
-            || frame.end_position != self.actions + 1
-            || frame.logical_time_start != self.actions
-            || frame.logical_time_end != self.actions + 1
-            || self.actions >= MAX_ACTIONS
-        {
-            return Err("Invalid application frame".into());
-        }
-        let action: Value = serde_json::from_slice(&frame.payload).map_err(|e| e.to_string())?;
-        self.game.apply(&action)?;
-        self.actions += 1;
-        // Host-side application execution. No CKB scripts are executed; never invent VM cycles.
-        Ok(ExecutionOutcome {
-            ordered_cell_tx_commitments: vec![],
-            data_commitments: vec![self.state_root()],
-            outbox: vec![],
-            cycles: 0,
+        context: CommandContext,
+        command: &OriginalCommand,
+    ) -> std::result::Result<BusinessOutcome, String> {
+        let intent: Intent =
+            serde_json::from_slice(&command.canonical_command).map_err(|e| e.to_string())?;
+        Ok(match self.act(context, &intent, command) {
+            Ok(()) => BusinessOutcome::Succeeded(
+                serde_json::to_vec(&match self.next_session {
+                    Some(id) => json!({"next_session":hex::encode(id)}),
+                    None => json!({"state":hex::encode(hash(&serde_json::to_vec(&self.game).map_err(|e| e.to_string())?)),"tick":self.game.tick,"level":self.game.level,"coins":self.game.coins,"spent":self.game.spent,"stock":self.game.stock,"mode":self.game.mode}),
+                })
+                .map_err(|e| e.to_string())?,
+            ),
+            Err(reason) => BusinessOutcome::Rejected(reason.into_bytes()),
         })
     }
-}
-fn profile(kind: Kind) -> ApplicationProfile {
-    let mut program = blake3::Hasher::new();
-    for b in
-        [include_bytes!("game.rs").as_slice(), include_bytes!("session.rs").as_slice(), include_bytes!("../Cargo.lock").as_slice()]
-    {
-        program.update(b);
+    fn inspect(&self, query: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        if query != b"state" {
+            return Err("Unsupported query".into());
+        }
+        serde_json::to_vec(
+            &json!({"game":self.game.view(), "next_session":self.next_session.map(hex::encode),"admission":{"actor":self.actor}}),
+        )
+        .map_err(|e| e.to_string())
     }
-    ApplicationProfile {
-        command_identity_required: false,
-        application_id: format!("{ID}/{}", kind.id()),
-        program_digest: *program.finalize().as_bytes(),
-        input_schema_hash: hash(b"neon-miner-tapes-30hz-1-to-60-five-bit-controls-and-shop-next-retry"),
-        state_codec_hash: hash(b"neon-miner-integer-state-json"),
-        logical_time_policy_hash: hash(b"one-accepted-action-one-logical-tick"),
-        entropy_policy_hash: hash(b"park-miller-sector-seed-92017"),
-        vm: ApplicationVmProfile { spawn_ipc_required: false },
+}
+fn profile(public: XOnlyPublicKey) -> AnyResult<ApplicationProfile> {
+    Ok(CommandProfile {
+        application_id: format!("{ID}/commands-v1"),
+        program_digest: artifact()?,
+        command_schema: hash(
+            b"miner-intent-v1:action,expected_cursor,expected_block,actor-account;ticks=1..60-u5;integer-30Hz;buy,next,retry,new_game",
+        ),
+        authorization_policy: hash(
+            &[
+                b"gateway-BIP340;single-expedition-owner;terminal-new-game;"
+                    .as_slice(),
+                &public.serialize(),
+            ]
+            .concat(),
+        ),
+        entropy_policy: hash(b"park-miller-16807-mod-2147483647;sector-seed=92017+level*104729;integer-truncation;game-state-tick-30Hz;command-clock-is-not-physics"),
+        clock: ApplicationClock::CommandSteps,
         resources: ApplicationResourceEnvelope {
             max_frame_inputs: 1,
-            max_frame_input_bytes: 4096,
+            max_frame_input_bytes: 8192,
             max_frame_cycles: 1,
             max_logical_time_span: 1,
-            max_inspect_query_bytes: 1024,
-            max_inspect_result_bytes: 1000000,
+            max_inspect_query_bytes: 32,
+            max_inspect_result_bytes: 128_000,
         },
-        court_profile_hash: hash(b"host-replay-only-no-ckb-court-or-settlement"),
-        handoff_policy_hash: hash(b"no-handoffs"),
     }
+    .build()?)
 }
-type Chain = SessionChain<Executor, RocksSessionStore>;
+fn consensus(public: [u8; 33]) -> ConsensusConfig {
+    ConsensusConfig::proof_of_authority(ProofOfAuthorityConfig {
+        authorities: vec![Authority {
+            id: ID.into(),
+            public_key: public,
+        }],
+    })
+}
+fn restore(
+    cfg: &SessionConfig,
+    public: XOnlyPublicKey,
+    bytes: &[u8],
+) -> myelin_session::Result<CommandExecutor<Program>> {
+    CommandExecutor::restore(cfg.clone(), bytes, Arc::new(Auth(public)), Program::restore)
+        .map_err(SessionError::Execution)
+}
 pub struct App {
-    chain: Chain,
-    store: Arc<RocksSessionStore>,
-    signer: CommitteeSigner,
-    verifier: Arc<Verifier>,
-    dir: PathBuf,
-    kind: Kind,
+    root: PathBuf,
+    namespace_lock: Arc<fs::File>,
+    cfg: SessionConfig,
+    authority: SessionAuthority<CommandExecutor<Program>>,
+    journal: CommandJournal,
+    worker: AuthoritySigner,
+    auth: Keypair,
+    finality: [u8; 33],
 }
 impl App {
-    pub fn open(dir: &Path, kind: Kind) -> AnyResult<Self> {
-        fs::create_dir_all(dir)?;
-        let store = Arc::new(RocksSessionStore::open(dir.join("sessions"))?);
-        let key_path = dir.join("authority.key");
-        let key = if key_path.exists() {
-            fs::read(&key_path)?.try_into().map_err(|_| "Invalid authority key")?
+    pub fn open(root: &Path) -> AnyResult<Self> {
+        fs::create_dir_all(root)?;
+        let lock = Arc::new(
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(root.join("namespace.lock"))?,
+        );
+        lock.try_lock()?;
+        let active = root.join("active");
+        if !active.exists()
+            && fs::read_dir(root)?
+                .any(|entry| entry.map_or(true, |e| e.file_name() != "namespace.lock"))
+        {
+            return Err(
+                "Missing active session in a nonempty namespace; refusing to replace history"
+                    .into(),
+            );
+        }
+        let mut value = if active.exists() {
+            let id = parse_id(fs::read_to_string(&active)?.trim())?;
+            Self::open_session(root, id, false, lock)?
         } else {
-            let k = random()?;
-            atomic(&key_path, &k)?;
-            k
+            let id = random()?;
+            let value = Self::prepare_session(root, id, lock)?;
+            atomic(&active, hex::encode(id).as_bytes())?;
+            value
         };
-        let signer = CommitteeSigner::new(ID, key)?;
-        let verifier = verifier(signer.ckb_public_key())?;
-        let active = dir.join("active");
-        let chain = if active.exists() {
-            let id: Hash32 = hex::decode(fs::read_to_string(&active)?.trim())?.try_into().map_err(|_| "Invalid session id")?;
-            let audit = Chain::audit_recovery(id, &profile(kind), verifier.as_ref(), store.as_ref())?;
-            let executor = Executor::restore(audit.state_snapshot())?;
-            let chain = Chain::recover_audited(audit, &profile(kind), verifier.clone(), executor, store.clone())?;
-            if let Some(end) = chain.head().finalised_height {
-                chain.replay_range(0, end, Executor::restore)?;
+        value.activate_next()?;
+        Ok(value)
+    }
+    // The old session's committed command is the durable creation intent. A
+    // target becomes visible only after every database is closed and its whole
+    // prepared directory is renamed. Incomplete preparation is disposable.
+    fn prepare_session(root: &Path, id: Hash32, lock: Arc<fs::File>) -> AnyResult<Self> {
+        let target = root.join(hex::encode(id));
+        if !target.exists() {
+            let staging = root.join(format!("preparing-{}", hex::encode(id)));
+            if staging.exists() {
+                fs::remove_dir_all(&staging)?;
             }
-            chain
+            drop(Self::open_session(root, id, true, lock.clone())?);
+            #[cfg(unix)]
+            fs::File::open(&staging)?.sync_all()?;
+            #[cfg(test)]
+            creation_fault("target-prepared");
+            fs::rename(&staging, &target)?;
+            #[cfg(unix)]
+            fs::File::open(root)?.sync_all()?;
+            #[cfg(test)]
+            creation_fault("target-published");
+        }
+        Self::open_session(root, id, false, lock)
+    }
+    fn activate_next(&mut self) -> AnyResult<()> {
+        let mut seen = HashSet::new();
+        while let Some(id) = self.view()?["session"]["next_session"].as_str() {
+            let id = parse_id(id)?;
+            if !seen.insert(id) || id == self.cfg.session_id {
+                return Err("Cyclic session creation".into());
+            }
+            let next = Self::prepare_session(&self.root, id, self.namespace_lock.clone())?;
+            atomic(&self.root.join("active"), hex::encode(id).as_bytes())?;
+            #[cfg(test)]
+            creation_fault("active-published");
+            *self = next;
+        }
+        Ok(())
+    }
+    fn open_session(
+        root: &Path,
+        id: Hash32,
+        fresh: bool,
+        namespace_lock: Arc<fs::File>,
+    ) -> AnyResult<Self> {
+        let key_path = root.join("command-roles.key");
+        let secret: Hash32 = if key_path.exists() {
+            fs::read(&key_path)?
+                .try_into()
+                .map_err(|_| "Invalid role secret")?
         } else {
-            Self::create(store.clone(), verifier.clone(), dir, kind)?
+            if !fresh || root.join("active").exists() {
+                return Err("Existing session is missing its role secret".into());
+            }
+            let secret = random()?;
+            atomic(&key_path, &secret)?;
+            secret
         };
-        Ok(Self { chain, store, signer, verifier, dir: dir.into(), kind })
-    }
-    fn create(store: Arc<RocksSessionStore>, verifier: Arc<Verifier>, dir: &Path, kind: Kind) -> AnyResult<Chain> {
-        let executor = Executor::new(kind);
-        let d = verifier.descriptor();
-        let config = SessionConfig {
-            session_id: random()?,
-            consensus_kind: ConsensusKind::ProofOfAuthority,
-            consensus_config_commitment: d.config_commitment,
-            consensus_module_commitment: d.commitment(),
-            consensus_wal_schema_hash: d.wal_schema_hash,
-            application_profile: profile(kind),
-            initial_state_root: executor.state_root(),
-            initial_input_position: 0,
-            initial_logical_time: 0,
-            initial_timestamp_ms: 0,
-            predecessor: None,
-            max_block_transactions: 1,
-            max_block_bytes: 4096,
-            max_future_drift_ms: 0,
+        let role = |name: &[u8]| hash(&[secret.as_slice(), name].concat());
+        let finality = CommitteeSigner::new(ID, role(b"finality"))?;
+        let public = finality.ckb_public_key();
+        let administrator = AuthoritySigner::new(role(b"administrator"))?;
+        let certificates = AuthoritySigner::new(role(b"certificates"))?;
+        let worker = AuthoritySigner::new(role(b"worker"))?;
+        let auth = Keypair::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_slice(&role(b"admission"))?,
+        );
+        let auth_public = auth.x_only_public_key().0;
+        let directory = root.join(if fresh {
+            format!("preparing-{}", hex::encode(id))
+        } else {
+            hex::encode(id)
+        });
+        let cfg_path = directory.join("genesis");
+        let cfg = if fresh {
+            fs::create_dir(&directory)?;
+            let profile = profile(auth_public)?;
+            let verifier = RegisteredFinalityVerifier::new(consensus(public))?;
+            let d = verifier.descriptor();
+            let limits = CommitResourceLimits::default();
+            let initial = CommandExecutor::initial_root(
+                &profile,
+                &Program::default(),
+                0,
+                0,
+                limits.max_snapshot_bytes,
+            )?;
+            let cfg = SessionConfig {
+                session_id: id,
+                consensus_kind: d.consensus_kind,
+                consensus_config_commitment: d.config_commitment,
+                consensus_module_commitment: d.commitment(),
+                consensus_wal_schema_hash: d.wal_schema_hash,
+                application_profile: profile,
+                initial_state_root: initial,
+                initial_input_position: 0,
+                initial_logical_time: 0,
+                initial_timestamp_ms: 0,
+                predecessor: None,
+                max_block_transactions: 1,
+                max_block_bytes: 8192,
+                max_future_drift_ms: 0,
+                commit_limits: limits,
+                protocol_effects: ProtocolEffectsPolicy::Disabled,
+            };
+            atomic(&cfg_path, &cfg.encode()?)?;
+            #[cfg(test)]
+            creation_fault("target-genesis");
+            cfg
+        } else {
+            SessionConfig::decode(&fs::read(&cfg_path)?)?
         };
-        let chain = Chain::create(config, verifier, executor, store)?;
-        atomic(&dir.join("active"), hex::encode(chain.head().session_id).as_bytes())?;
-        Ok(chain)
+        if cfg.session_id != id || cfg.application_profile != profile(auth_public)? {
+            return Err("Session profile differs from this exact current executable".into());
+        }
+        if !fresh
+            && (!directory.join("canonical/CURRENT").exists()
+                || !directory.join("epochs/CURRENT").exists()
+                || !directory.join("journal/CURRENT").exists())
+        {
+            return Err("Current session is missing its canonical store, authority epochs or original-command journal".into());
+        }
+        let authority = SessionAuthority::open(
+            myelin_session_authority::CanonicalLedger::open(directory.join("canonical"))?,
+            directory.join("epochs"),
+            AuthorityConfig {
+                session: cfg.clone(),
+                consensus: consensus(public),
+                administrator: administrator.public_key(),
+                effect_domain: id,
+            },
+            AuthorityKeys {
+                finality,
+                certificates,
+            },
+            CommandExecutor::new(cfg.clone(), Program::default(), Arc::new(Auth(auth_public)))?,
+            |bytes| restore(&cfg, auth_public, bytes).map_err(|e| e.to_string()),
+        )?;
+        #[cfg(test)]
+        if fresh {
+            creation_fault("target-authority");
+        }
+        let journal = CommandJournal::open_fenced(
+            directory.join("journal"),
+            &cfg,
+            JournalLimits {
+                max_entries: MAX_ACTIONS as usize + 1,
+                max_encoded_bytes: 32 * 1024 * 1024,
+                max_command_bytes: 8192,
+                max_authorization_bytes: 128,
+                max_result_bytes: 128_000,
+            },
+            authority.policy().clone(),
+        )?;
+        recover_local_commands(&authority, &journal, &administrator, &worker)?;
+        let mut value = Self {
+            root: root.into(),
+            namespace_lock,
+            cfg,
+            authority,
+            journal,
+            worker,
+            auth,
+            finality: public,
+        };
+        value.drain()?;
+        Ok(value)
     }
-    pub fn new_game(&mut self) -> AnyResult<Value> {
-        self.chain = Self::create(self.store.clone(), self.verifier.clone(), &self.dir, self.kind)?;
+    fn drain(&mut self) -> AnyResult<()> {
+        while let Some(reserved) = self.journal.reserve_commands(
+            &self.authority.head()?,
+            1,
+            8192,
+            &Auth(self.auth.x_only_public_key().0),
+        )? {
+            let head = self.authority.head()?;
+            let grant = self.authority.current_grant()?.ok_or("No writer grant")?;
+            let now = head.timestamp_ms.checked_add(1).ok_or("Time overflow")?;
+            let request = request_from_reservation(&self.cfg, &reserved, now, now)?;
+            let authorization =
+                self.worker
+                    .authorize_commit(self.authority.policy(), &grant, &head, &request)?;
+            let binding = self.journal.begin_fenced_commit(
+                reserved.token,
+                self.authority.policy().clone(),
+                grant,
+                authorization,
+                &request,
+            )?;
+            if let Err(error) = self
+                .authority
+                .commit(binding.authorization.clone(), request, now)
+            {
+                self.journal.mark_unknown(reserved.token)?;
+                return Err(error.into());
+            }
+            let observed = self
+                .authority
+                .reconcile_submission(&binding.authorization, &binding.commands)?;
+            self.journal
+                .reconcile_fenced(reserved.token, &observed, business_result)?;
+        }
+        Ok(())
+    }
+    pub fn new_game(&mut self, body: Value, actor: Actor) -> AnyResult<Value> {
+        let req: Request = serde_json::from_value(body.clone())?;
+        if req.action != json!({"type":"new_game"}) {
+            return Err("New-game requests require the exact expedition lifecycle command".into());
+        }
+        let session = parse_id(&req.session_id)?;
+        let report = if session == self.cfg.session_id {
+            let result = self.submit(body, actor)?;
+            #[cfg(test)]
+            creation_fault("intent-committed");
+            self.activate_next()?;
+            result["command"].clone()
+        } else {
+            // Resolve only an already-admitted historical identity. Never
+            // enqueue new work in an old session or move the active pointer back.
+            let mut past =
+                Self::open_session(&self.root, session, false, self.namespace_lock.clone())?;
+            if past.journal.entry(parse_id(&req.command_id)?)?.is_none() {
+                return Err("New-game command was not admitted in the requested session".into());
+            }
+            past.submit(body, actor)?["command"].clone()
+        };
+        let mut view = self.view()?;
+        view["command"] = report;
+        Ok(view)
+    }
+    pub fn state(&mut self) -> AnyResult<Value> {
+        self.activate_next()?;
         self.view()
     }
     pub fn view(&self) -> AnyResult<Value> {
-        let h = self.chain.head();
-        let (_, snapshot) = Chain::recovery_snapshot(self.store.as_ref(), h.session_id)?;
-        let e = Executor::restore(&snapshot)?;
+        let head = self.authority.head()?;
+        let inspect = command_inspector(
+            self.cfg.clone(),
+            Arc::new(Auth(self.auth.x_only_public_key().0)),
+            Program::restore,
+        );
+        let inspected: Value =
+            serde_json::from_slice(&self.authority.inspect_head(&inspect, b"state")?.result)?;
+        let capabilities = CommandExecutor::new(
+            self.cfg.clone(),
+            Program::default(),
+            Arc::new(Auth(self.auth.x_only_public_key().0)),
+        )?
+        .capabilities();
         Ok(
-            json!({"game":e.game.view(),"session":{"id":hex::encode(h.session_id),"height":h.finalised_height,"actions":h.input_position,"state_root":hex::encode(h.state_root),"block_hash":hex::encode(h.block_hash),"profile":hex::encode(profile(self.kind).commitment()),"authority":hex::encode(self.signer.ckb_public_key()),"mode":"local-poa-host-replay","ckb_settled":false}}),
+            json!({"game":inspected["game"],"admission":inspected["admission"],"capabilities":capabilities,"session":{"next_session":inspected["next_session"],"id":hex::encode(head.session_id),"height":head.finalised_height,
+            "actions":head.input_position,"state_root":hex::encode(head.state_root),"block_hash":hex::encode(head.block_hash),
+            "profile":hex::encode(self.cfg.application_profile.commitment()),"authority":hex::encode(self.finality),"mode":"gateway-attested-local-poa-host-replay","ckb_settled":false}}),
         )
     }
-    pub fn action(&mut self, body: Value) -> AnyResult<Value> {
-        let object = body.as_object().ok_or("Expected object")?;
-        if object.len() != 3 || !["action", "expected_block", "session_id"].iter().all(|k| object.contains_key(*k)) {
-            return Err("Unknown or missing request field".into());
-        }
-        let head = self.chain.head();
-        if body.get("expected_block").and_then(Value::as_str) != Some(hex::encode(head.block_hash).as_str())
-            || body.get("session_id").and_then(Value::as_str) != Some(hex::encode(head.session_id).as_str())
-        {
-            return Err("Stale session. Refresh and try again.".into());
-        }
-        let action = body.get("action").ok_or("Missing action")?;
-        let payload = serde_json::to_vec(action)?;
-        let pos = head.input_position;
-        let prepared = self.chain.prepare_block(BlockRequest {
-            transactions: vec![],
-            frame_input: FrameInput {
-                commands: vec![],
-                start_position: pos,
-                end_position: pos + 1,
-                logical_time_start: pos,
-                logical_time_end: pos + 1,
-                payload,
-            },
-            scheduler_commitment: hash(b"serial-game-actions"),
-            data_commitments: vec![],
-            timestamp_ms: pos + 1,
-            local_now_ms: pos + 1,
-            successor: None,
-            handoffs: vec![],
-            consume_handoffs: vec![],
-        })?;
-        let engine = match &self.verifier.0 {
-            SelectedConsensus::ProofOfAuthority(e) => e,
-            _ => unreachable!(),
+    pub fn command(&self, session: &str, command: &str) -> AnyResult<Value> {
+        let id = parse_id(session)?;
+        let command_id = parse_id(command)?;
+        let entry = if id == self.cfg.session_id {
+            self.journal.entry(command_id)?
+        } else {
+            let past = Self::open_session(&self.root, id, false, self.namespace_lock.clone())?;
+            past.journal.entry(command_id)?
         };
-        let seal = engine.seal_from_signer(prepared.block().hash(), prepared.block().number, &self.signer)?;
-        self.chain.commit_finalised(prepared, FinalityProof::ProofOfAuthority(seal))?;
-        self.view()
+        Ok(json!({"command_id":command,"session_id":session,"entry":entry}))
+    }
+    pub fn action(&mut self, body: Value, actor: Actor) -> AnyResult<Value> {
+        if body["action"]["type"] == "new_game" {
+            return Err("Use the new-game endpoint".into());
+        }
+        self.submit(body, actor)
+    }
+    fn submit(&mut self, body: Value, actor: Actor) -> AnyResult<Value> {
+        actor.validate()?;
+        let req: Request = serde_json::from_value(body)?;
+        let id = parse_id(&req.command_id)?;
+        if parse_id(&req.session_id)? != self.cfg.session_id
+            || parse_id(&req.profile)? != self.cfg.application_profile.commitment()
+        {
+            return Err("Wrong command session/profile".into());
+        }
+        let intent = Intent {
+            action: req.action,
+            expected_cursor: req.expected_cursor,
+            expected_block: req.expected_block,
+            actor,
+        };
+        let payload = serde_json::to_vec(&intent)?;
+        if self.journal.entry(id)?.is_none() {
+            if !self.view()?["session"]["next_session"].is_null() {
+                return Err("Session is closed; resolve its existing creation command".into());
+            }
+            let head = self.authority.head()?;
+            if parse_id(&intent.expected_block)? != head.block_hash
+                || intent.expected_cursor != head.input_position
+            {
+                return Err(
+                    "Stale construction head; refresh before creating a new command".into(),
+                );
+            }
+            if head.input_position > MAX_ACTIONS
+                || (head.input_position == MAX_ACTIONS
+                    && intent.action != json!({"type":"new_game"}))
+            {
+                return Err("Action limit reached".into());
+            }
+        }
+        let mut original = OriginalCommand {
+            scope: CommandScope::from_config(&self.cfg),
+            identity: CommandIdentity {
+                id,
+                payload_hash: hash(&payload),
+            },
+            kind: InputKind::UserCommand,
+            canonical_command: payload,
+            authentication_context: self.auth.x_only_public_key().0.serialize().to_vec(),
+            authorization: vec![],
+        };
+        original.authorization = Secp256k1::new()
+            .sign_schnorr_no_aux_rand(
+                &Message::from_digest(original.authorization_digest()),
+                &self.auth,
+            )
+            .as_ref()
+            .to_vec();
+        self.journal
+            .enqueue(original, &Auth(self.auth.x_only_public_key().0))?;
+        self.drain()?;
+        self.journal.acknowledge(id)?;
+        let mut view = self.view()?;
+        view["command"] = self.command(&req.session_id, &req.command_id)?;
+        Ok(view)
     }
     pub fn replay(&self) -> AnyResult<Value> {
-        let Some(end) = self.chain.head().finalised_height else {
-            return Ok(json!({"verified":true,"frames":0,"message":"Genesis only; play first."}));
+        let Some(end) = self.authority.head()?.finalised_height else {
+            return Ok(json!({"verified":true,"frames":0}));
         };
-        let r = self.chain.replay_range(0, end, Executor::restore)?;
+        let cfg = self.cfg.clone();
+        let public = self.auth.x_only_public_key().0;
+        let receipt = self
+            .authority
+            .replay_range(0, end, move |bytes| restore(&cfg, public, bytes))?;
         Ok(
-            json!({"verified":true,"frames":r.frame_count,"receipt_commitment":hex::encode(r.commitment()),"state_root":hex::encode(r.state_root_after),"receipt":r}),
+            json!({"verified":true,"frames":receipt.frame_count,"receipt_commitment":hex::encode(receipt.commitment()),"state_root":hex::encode(receipt.state_root_after),"receipt":receipt}),
         )
     }
     pub fn export(&self) -> AnyResult<Value> {
-        let id = self.chain.head().session_id;
-        let blocks =
-            self.store.load_chain(id)?.iter().map(|r| r.encode().map(hex::encode)).collect::<myelin_session::Result<Vec<_>>>()?;
+        let head = self.authority.head()?;
+        let mut blocks = vec![];
+        let mut total = 0usize;
+        for height in 0..head.next_height()? {
+            let bytes = self.authority.block(height)?.encode()?;
+            total = total
+                .checked_add(bytes.len() * 2)
+                .ok_or("Export size overflow")?;
+            if total > 30 * 1024 * 1024 {
+                return Err("Export exceeds bounded JSON size".into());
+            }
+            blocks.push(hex::encode(bytes));
+        }
         Ok(
-            json!({"format":"myelin-game-session-1","application":ID,"game":self.kind,"authority":hex::encode(self.signer.ckb_public_key()),"config":hex::encode(self.chain.config().encode()?),"blocks":blocks,"head":hex::encode(self.chain.head().encode()?)}),
+            json!({"format":"myelin-neon-miner-commands-v1","application":ID,"authority":hex::encode(self.finality),
+            "admission":hex::encode(self.auth.x_only_public_key().0.serialize()),"config":hex::encode(self.cfg.encode()?),"blocks":blocks,"head":hex::encode(head.encode()?)}),
         )
     }
 }
-pub fn verify_export(v: &Value) -> AnyResult<Value> {
-    if v["format"] != "myelin-game-session-1" || v["application"] != ID {
-        return Err("Wrong export format or game".into());
+pub fn verify_export(value: &Value) -> AnyResult<Value> {
+    if value["format"] != "myelin-neon-miner-commands-v1" || value["application"] != ID {
+        return Err("Unsupported export format/application".into());
     }
-    let get = |key: &str| -> AnyResult<Vec<u8>> { Ok(hex::decode(v[key].as_str().ok_or("Missing export field")?)?) };
-    let kind: Kind = serde_json::from_value(v["game"].clone())?;
+    let get = |key: &str| -> AnyResult<Vec<u8>> {
+        Ok(hex::decode(
+            value[key].as_str().ok_or("Missing export field")?,
+        )?)
+    };
     let cfg = SessionConfig::decode(&get("config")?)?;
-    if cfg.application_profile != profile(kind) {
-        return Err("Application artifact or rules do not match this build".into());
+    let public = XOnlyPublicKey::from_slice(&get("admission")?)?;
+    if cfg.application_profile != profile(public)? {
+        return Err("Export requires its exact current executable and admitted profile".into());
     }
-    let public: [u8; 33] = get("authority")?.try_into().map_err(|_| "Invalid public key")?;
-    let verifier = verifier(public)?;
+    let authority: [u8; 33] = get("authority")?
+        .try_into()
+        .map_err(|_| "Invalid authority")?;
+    let verifier = Arc::new(RegisteredFinalityVerifier::new(consensus(authority))?);
     let dir = tempfile::tempdir()?;
-    let store = Arc::new(RocksSessionStore::open(dir.path().join("db"))?);
-    let mut chain = Chain::create(cfg, verifier, Executor::new(kind), store)?;
-    let blocks = v["blocks"].as_array().ok_or("Missing blocks")?;
-    if blocks.len() > MAX_ACTIONS as usize {
+    let store = Arc::new(RocksSessionStore::open(dir.path())?);
+    let initial = CommandExecutor::new(cfg.clone(), Program::default(), Arc::new(Auth(public)))?;
+    let mut chain = SessionChain::create(cfg, verifier, initial, store)?;
+    let blocks = value["blocks"].as_array().ok_or("Missing blocks")?;
+    if blocks.len() > MAX_ACTIONS as usize + 1 {
         return Err("Too many blocks".into());
     }
     for bytes in blocks {
-        let r = FinalisedBlockRecord::decode(&hex::decode(bytes.as_str().ok_or("Invalid block")?)?)?;
-        if !r.state_snapshot.is_empty() && Executor::restore(&r.state_snapshot)?.state_root() != r.block.state_root_after {
-            return Err("Invalid record snapshot".into());
+        let record =
+            FinalisedBlockRecord::decode(&hex::decode(bytes.as_str().ok_or("Invalid record")?)?)?;
+        if !record.state_snapshot.is_empty()
+            && restore(chain.config(), public, &record.state_snapshot)?.state_root()
+                != record.block.state_root_after
+        {
+            return Err("Invalid snapshot".into());
         }
-        if r.successor.is_some() || !r.issued_handoffs.is_empty() || !r.consumed_handoff_ids.is_empty() {
-            return Err("Unexpected handoff".into());
+        if record.successor.is_some()
+            || !record.issued_handoffs.is_empty()
+            || !record.consumed_handoff_ids.is_empty()
+            || !record.handoff_actions.is_empty()
+        {
+            return Err("Unsupported protocol effects".into());
         }
-        let p = chain.prepare_block(BlockRequest {
-            transactions: r.transactions,
-            frame_input: r.frame_input,
-            scheduler_commitment: r.block.scheduler_commitment,
-            data_commitments: r.request_data_commitments,
-            timestamp_ms: r.block.timestamp_ms,
-            local_now_ms: r.block.timestamp_ms,
+        let prepared = chain.prepare_block(BlockRequest {
+            transactions: record.transactions,
+            frame_input: record.frame_input,
+            scheduler_commitment: record.block.scheduler_commitment,
+            data_commitments: record.request_data_commitments,
+            timestamp_ms: record.block.timestamp_ms,
+            local_now_ms: record.block.timestamp_ms,
             successor: None,
             handoffs: vec![],
             consume_handoffs: vec![],
+            handoff_actions: vec![],
         })?;
-        if p.block().hash() != r.block.hash() || p.frame() != &r.frame {
-            return Err("Replayed execution does not match signed block".into());
+        if prepared.block().hash() != record.block.hash() || prepared.frame() != &record.frame {
+            return Err("Replay differs from signed block".into());
         }
-        chain.commit_finalised(p, r.proof)?;
+        chain.commit_finalised(prepared, record.proof)?;
     }
     if chain.head() != &SessionHead::decode(&get("head")?)? {
-        return Err("Export head does not match replay".into());
+        return Err("Export head differs from replay".into());
     }
     Ok(
-        json!({"verified":true,"frames":blocks.len(),"state_root":hex::encode(chain.head().state_root),"authority":hex::encode(public)}),
+        json!({"verified":true,"frames":blocks.len(),"state_root":hex::encode(chain.head().state_root),"authority":hex::encode(authority),"canonical_fencing":"not-verified","trust":"application replay and ordinary PoA finality under a self-declared authority; canonical acceptance additionally requires an independently pinned fencing policy and canonical certificates"}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn action() -> Value {
-        json!({"type":"ticks","inputs":[2,2,0,0,0,0,0,0,0,0]})
+    fn request(view: &Value, id: u8, action: Value) -> Value {
+        json!({"command_id":hex::encode([id;32]),"session_id":view["session"]["id"],"profile":view["session"]["profile"],"expected_cursor":view["session"]["actions"],"expected_block":view["session"]["block_hash"],"action":action})
+    }
+    fn actor() -> Actor {
+        Actor {
+            account: hex::encode([7; 32]),
+        }
     }
     #[test]
-    fn signed_session_recovery_replay_and_tamper_rejection() {
+    fn duplicate_recovery_actor_isolation_and_signed_export() {
+        if let Ok(path) = std::env::var("MINER_CREATION_ROOT") {
+            let mut app = App::open(Path::new(&path)).unwrap();
+            let req = request(&app.view().unwrap(), 250, json!({"type":"new_game"}));
+            app.new_game(req, actor()).unwrap();
+            panic!("The selected process-exit boundary did not execute");
+        }
+        // Exercise interruption of real filesystem/database writes inside this
+        // existing integration test, not a second mirrored lifecycle suite.
+        for point in [
+            "intent-committed",
+            "target-genesis",
+            "target-authority",
+            "target-prepared",
+            "target-published",
+            "active-published",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let app = App::open(dir.path()).unwrap();
+            assert!(
+                App::open(dir.path()).is_err(),
+                "namespace must have one owner"
+            );
+            let before = app.view().unwrap();
+            let req = request(&before, 250, json!({"type":"new_game"}));
+            drop(app);
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "session::tests::duplicate_recovery_actor_isolation_and_signed_export",
+                    "--nocapture",
+                ])
+                .env("MINER_CREATION_ROOT", dir.path())
+                .env("MINER_CREATION_FAULT", point)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(86),
+                "{point}: {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let mut app = App::open(dir.path()).unwrap();
+            let after = app.new_game(req.clone(), actor()).unwrap();
+            assert_ne!(after["session"]["id"], before["session"]["id"], "{point}");
+            assert_eq!(after["session"]["actions"], 0);
+            let report = app
+                .command(
+                    req["session_id"].as_str().unwrap(),
+                    req["command_id"].as_str().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(report, after["command"]);
+            let original: OriginalCommand =
+                serde_json::from_value(report["entry"]["original"].clone()).unwrap();
+            let target = hex::encode(hash(
+                &[
+                    b"miner-new-session-v1".as_slice(),
+                    &original.authorization_digest(),
+                ]
+                .concat(),
+            ));
+            assert_eq!(after["session"]["id"], target);
+            assert_eq!(app.new_game(req, actor()).unwrap(), after);
+            let past = App::open_session(
+                dir.path(),
+                parse_id(before["session"]["id"].as_str().unwrap()).unwrap(),
+                false,
+                app.namespace_lock.clone(),
+            )
+            .unwrap();
+            assert_eq!(past.view().unwrap()["session"]["next_session"], target);
+            assert_eq!(past.replay().unwrap()["frames"], 1);
+            assert_eq!(
+                verify_export(&past.export().unwrap()).unwrap()["verified"],
+                true
+            );
+            assert!(!dir.path().join(format!("preparing-{target}")).exists());
+            println!("Recovered creation after {point}");
+        }
         let dir = tempfile::tempdir().unwrap();
-        let mut app = App::open(dir.path(), Kind::NeonMiner).unwrap();
+        let mut app = App::open(dir.path()).unwrap();
         let before = app.view().unwrap();
-        let request = json!({"action":action(),"expected_block":before["session"]["block_hash"],"session_id":before["session"]["id"]});
-        let after = app.action(request.clone()).unwrap();
-        assert_ne!(before["session"]["state_root"], after["session"]["state_root"]);
-        assert!(app.action(request).is_err());
+        let req = request(
+            &before,
+            1,
+            json!({"type":"ticks","inputs":[1,0,0,0,0,0,0,0,0,0]}),
+        );
+        let after = app.action(req.clone(), actor()).unwrap();
+        assert_eq!(after["session"]["actions"], 1);
+        assert_eq!(
+            app.action(req.clone(), actor()).unwrap()["command"],
+            after["command"]
+        );
+        assert!(app
+            .action(
+                req.clone(),
+                Actor {
+                    account: hex::encode([8; 32]),
+                }
+            )
+            .is_err());
+        assert!(app
+            .action(
+                request(&before, 2, json!({"type":"ticks","inputs":[0]})),
+                actor()
+            )
+            .is_err());
+        let mut conflict = req.clone();
+        conflict["action"]["inputs"] = json!([0, 0]);
+        assert!(app.action(conflict, actor()).is_err());
         assert_eq!(app.replay().unwrap()["frames"], 1);
         let export = app.export().unwrap();
         assert_eq!(verify_export(&export).unwrap()["verified"], true);
-        let mut tampered = export.clone();
-        let mut bytes = hex::decode(tampered["blocks"][0].as_str().unwrap()).unwrap();
-        let end = bytes.len() - 1;
-        bytes[end] ^= 1;
-        tampered["blocks"][0] = json!(hex::encode(bytes));
-        assert!(verify_export(&tampered).is_err());
         drop(app);
-        let app = App::open(dir.path(), Kind::NeonMiner).unwrap();
-        assert_eq!(app.view().unwrap(), after);
-    }
-    #[test]
-    fn every_game_binds_its_profile_and_recovers_independently() {
-        {
-            let kind = Kind::NeonMiner;
-            let dir = tempfile::tempdir().unwrap();
-            let mut app = App::open(dir.path(), kind).unwrap();
-            let before = app.view().unwrap();
-            let after=app.action(json!({"session_id":before["session"]["id"],"expected_block":before["session"]["block_hash"],"action":{"type":"ticks","inputs":[0,0,0,0,0,0,0,0,0,0]}})).unwrap();
-            let export = app.export().unwrap();
-            assert_eq!(verify_export(&export).unwrap()["state_root"], after["session"]["state_root"]);
-            let mut wrong = export.clone();
-            wrong["game"] = json!("invalid-game");
-            assert!(verify_export(&wrong).is_err());
-            let mut wrong = export.clone();
-            wrong["authority"] = json!("02".to_owned() + &"00".repeat(32));
-            assert!(verify_export(&wrong).is_err());
-            drop(app);
-            assert_eq!(App::open(dir.path(), kind).unwrap().view().unwrap(), after);
-        }
+        let active = fs::read(dir.path().join("active")).unwrap();
+        fs::remove_file(dir.path().join("active")).unwrap();
+        assert!(App::open(dir.path()).is_err());
+        assert!(!dir.path().join("active").exists());
+        fs::write(dir.path().join("active"), active).unwrap();
+        let mut bad = export.clone();
+        bad["admission"] = json!(hex::encode([9; 32]));
+        assert!(verify_export(&bad).is_err());
+        let mut app = App::open(dir.path()).unwrap();
+        assert_eq!(
+            app.action(req.clone(), actor()).unwrap()["command"],
+            after["command"]
+        );
+        assert_eq!(app.view().unwrap()["game"], after["game"]);
+        let new_request = request(&app.view().unwrap(), 3, json!({"type":"new_game"}));
+        let new_view = app.new_game(new_request.clone(), actor()).unwrap();
+        assert_ne!(new_view["session"]["id"], after["session"]["id"]);
+        assert_eq!(new_view["session"]["actions"], 0);
+        assert_eq!(
+            app.new_game(new_request.clone(), actor()).unwrap(),
+            new_view
+        );
+        drop(app);
+        let mut app = App::open(dir.path()).unwrap();
+        assert_eq!(app.new_game(new_request, actor()).unwrap(), new_view);
+        assert!(app.action(req, actor()).is_err());
+        assert_eq!(verify_export(&export).unwrap()["verified"], true);
     }
 }
