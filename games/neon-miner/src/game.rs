@@ -78,7 +78,9 @@ fn sector_time(level: u32) -> u32 {
     1800 - 750.min((level - 1) * 13)
 }
 fn sector_goal(level: u32) -> u32 {
-    (380 + (level - 1) * 32 + (level - 1) / 15 * 100) * [100, 85, 65, 85, 85][((level - 1) % 5) as usize] / 100
+    (380 + (level - 1) * 32 + (level - 1) / 15 * 100)
+        * [100, 85, 65, 85, 85][((level - 1) % 5) as usize]
+        / 100
 }
 impl Game {
     pub fn new(kind: Kind) -> Self {
@@ -179,14 +181,21 @@ impl Game {
                 weight,
                 taken: false,
                 anchor: x,
-                vx: if self.level >= 11 && n % 3 == 0 { (if n % 2 == 1 { -1 } else { 1 }) * (1 + self.tier() as i32 / 2) } else { 0 },
+                vx: if self.level >= 11 && n % 3 == 0 {
+                    (if n % 2 == 1 { -1 } else { 1 }) * (1 + self.tier() as i32 / 2)
+                } else {
+                    0
+                },
                 armor: if kind == 7 { 1 + self.tier() / 2 } else { 0 },
             });
         }
     }
     pub fn tip(&self) -> (i32, i32) {
         let d = DIRECTIONS[self.angle as usize];
-        (500 + d[0] * self.length / 1000, 100 + d[1] * self.length / 1000)
+        (
+            500 + d[0] * self.length / 1000,
+            100 + d[1] * self.length / 1000,
+        )
     }
     fn reward(&mut self, coins: u32) {
         self.coins += coins;
@@ -256,7 +265,12 @@ impl Game {
         let action: Action = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
         match action {
             Action::Ticks { inputs } => {
-                if inputs.is_empty() || inputs.len() > 60 || inputs.iter().any(|i| *i > 31) || self.mode != "mining" || self.over {
+                if inputs.is_empty()
+                    || inputs.len() > 60
+                    || inputs.iter().any(|i| *i > 31)
+                    || self.mode != "mining"
+                    || self.over
+                {
                     return Err("Invalid tape or inactive sector".into());
                 }
                 for i in inputs {
@@ -322,7 +336,12 @@ impl Game {
         if owned >= 3 {
             return Err("Upgrade or stock limit reached".into());
         }
-        let price = base * if slot >= 4 { owned + 1 } else { 1 + self.tier() * self.tier() };
+        let price = base
+            * if slot >= 4 {
+                owned + 1
+            } else {
+                1 + self.tier() * self.tier()
+            };
         if self.coins < price {
             return Err("Mine more credits first".into());
         }
@@ -350,7 +369,13 @@ impl Game {
             _ => (7, 1 + u32::from(t > 1)),
         };
         self.ores[self.cargo as usize].kind != kind
-            || self.collected[kind as usize] + self.ores.iter().filter(|o| !o.taken && o.kind == kind).count() as u32 >= need
+            || self.collected[kind as usize]
+                + self
+                    .ores
+                    .iter()
+                    .filter(|o| !o.taken && o.kind == kind)
+                    .count() as u32
+                >= need
     }
     pub fn step(&mut self, input: u8) {
         if self.mode != "mining" || self.over {
@@ -431,8 +456,11 @@ impl Game {
                 }
             }
             2 => {
-                let speed =
-                    if self.cargo < 0 { 22 } else { ((18 + 4 * self.winch as i32) / self.ores[self.cargo as usize].weight).max(3) };
+                let speed = if self.cargo < 0 {
+                    22
+                } else {
+                    ((18 + 4 * self.winch as i32) / self.ores[self.cargo as usize].weight).max(3)
+                };
                 self.length = (self.length - speed * if self.boost > 0 { 2 } else { 1 }).max(36);
                 if self.length == 36 {
                     if self.cargo >= 0 {
@@ -442,7 +470,11 @@ impl Game {
                             self.time = self.time.saturating_sub(120 + self.tier() * 30);
                             self.combo = 0;
                         } else {
-                            let base = if kind == 2 { o.value * (100 + 20 * self.lens) / 100 } else { o.value };
+                            let base = if kind == 2 {
+                                o.value * (100 + 20 * self.lens) / 100
+                            } else {
+                                o.value
+                            };
                             let value = base * (100 + 5 * self.combo.min(5)) / 100;
                             self.score += value;
                             self.level_score += value;
@@ -460,7 +492,12 @@ impl Game {
                     self.phase = 0;
                     if self.level_score >= self.goal && self.contract_done() {
                         self.reward(20 + 5 * self.tier());
-                        self.mode = if self.level == SECTORS { "complete" } else { "cleared" }.into();
+                        self.mode = if self.level == SECTORS {
+                            "complete"
+                        } else {
+                            "cleared"
+                        }
+                        .into();
                         self.over = self.level == SECTORS;
                     }
                 }
@@ -558,7 +595,8 @@ mod tests {
     #[test]
     fn sixty_sector_campaign_is_replayable() {
         let mut g = Game::new(Kind::NeonMiner);
-        let actions: Vec<Value> = serde_json::from_str(include_str!("../../../tests/neon-miner-solutions.json")).unwrap();
+        let actions: Vec<Value> =
+            serde_json::from_str(include_str!("../../../tests/neon-miner-solutions.json")).unwrap();
         for action in actions {
             g.apply(&action).unwrap();
         }

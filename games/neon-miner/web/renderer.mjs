@@ -1,6 +1,7 @@
 import {tip, districts, tier} from './engine.mjs';
 import {loadArt, oreArt, scenes} from './art.mjs';
 import {aimingGuide} from './scanner.mjs';
+import {mineViewport} from './viewport.mjs';
 const colors = ['#ffc968','#ffd68a','#bc9aff','#8596ad','#73f5df','#ff87d7','#ff6073','#ffc968'];
 const accents = ['#6debe0','#ff89da','#85dcff','#ffad65'];
 
@@ -14,7 +15,8 @@ export class MinerRenderer {
   async load() { if(!this.art) this.art=await loadArt(); this.cache=null; }
   background(g) {
     const c=document.createElement('canvas'); c.width=1000; c.height=700;
-    const x=c.getContext('2d'); x.drawImage(this.art[scenes[tier(g)]],0,0,1000,700);
+    const x=c.getContext('2d'),image=this.art[scenes[tier(g)]],cover=Math.max(1000/image.width,700/image.height);
+    x.drawImage(image,(1000-image.width*cover)/2,(700-image.height*cover)/2,image.width*cover,image.height*cover);
     const shade=x.createLinearGradient(0,0,0,700); shade.addColorStop(0,'#03071320'); shade.addColorStop(.3,'#03071300'); shade.addColorStop(1,'#03071330');
     x.fillStyle=shade; x.fillRect(0,0,1000,700);
     x.font='500 11px monospace'; x.fillStyle='#b0c7da'; x.fillText(`↓ ${180+g.level*65} M`,24,31);
@@ -53,13 +55,20 @@ export class MinerRenderer {
   }
   draw(g,dt=16,alpha=1,previous=g) {
     const x=this.ctx,w=this.canvas.width,h=this.canvas.height;
-    x.setTransform(w/1000,0,0,h/700,0,0);x.clearRect(0,0,1000,700);
-    if(!this.art){x.fillStyle='#080e19';x.fillRect(0,0,1000,700);return;}
+    x.setTransform(1,0,0,1,0,0);x.clearRect(0,0,w,h);
+    if(!this.art){x.fillStyle='#080e19';x.fillRect(0,0,w,h);return;}
     this.clock+=dt/1000;
     if(!this.cache||g.level!==this.level) {
       this.background(g);this.particles=[];this.labels=[];this.rings=[];this.prev=null;
     }
-    const cover=Math.max(w/1000,h/700);x.setTransform(1,0,0,1,0,0);x.drawImage(this.cache,(w-1000*cover)/2,(h-700*cover)/2,1000*cover,700*cover);const cssW=this.canvas.clientWidth||1000,cssH=this.canvas.clientHeight||700,pixel=w/cssW,ui=Math.max(1,Math.min(2,cssH/1080)),top=cssW<=600?198:cssH<=540?100:134*ui,bottom=cssW<=600?130:76*ui,scale=Math.min(cssW/1000,Math.max(100,cssH-top-bottom)/700);x.setTransform(scale*pixel,0,0,scale*pixel,(cssW-1000*scale)/2*pixel,(top+(cssH-top-bottom-700*scale)/2)*pixel);
+    const cover=Math.max(w/1000,h/700);
+    x.drawImage(this.cache,(w-1000*cover)/2,(h-700*cover)/2,1000*cover,700*cover);
+    const cssW=this.canvas.clientWidth||1000,cssH=this.canvas.clientHeight||700;
+    const view=this.view||mineViewport(cssW,cssH);
+    // Account for backing-store rounding independently on each axis so the CSS
+    // world remains isotropic at fractional DPR and every quality setting.
+    const pixelX=w/cssW,pixelY=h/cssH;
+    x.setTransform(view.scale*pixelX,0,0,view.scale*pixelY,view.x*pixelX,view.y*pixelY);
     const color=accents[tier(g)], [tx,ty]=tip(g),[oldX,oldY]=tip(previous);
     const smooth=previous.level===g.level&&previous.phase===g.phase&&!this.reduced;
     const hx=smooth?oldX+(tx-oldX)*alpha:tx,hy=smooth?oldY+(ty-oldY)*alpha:ty;
