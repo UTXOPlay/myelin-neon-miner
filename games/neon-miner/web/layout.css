@@ -1,0 +1,154 @@
+/* The mine keeps its original geometry. HUD and equipment occupy the scenery
+   alongside it, inside the same full-viewport game image. No CSS canvas scaling. */
+.game-surface[data-surface="miner"] {
+  display:block;padding:0;width:100%;height:100dvh;overflow:hidden;
+}
+.game-surface[data-surface="miner"] .field {
+  --mine-ui:1;--mine-rail:132px;--mine-left:10px;--mine-right:10px;--mine-top:10px;--mine-bottom:10px;
+  --mine-safe-top:env(safe-area-inset-top,0px);--mine-safe-right:env(safe-area-inset-right,0px);
+  --mine-safe-bottom:env(safe-area-inset-bottom,0px);--mine-safe-left:env(safe-area-inset-left,0px);
+  position:absolute;inset:0;display:block;margin:0;padding:0;overflow:hidden;
+}
+.game-surface[data-surface="miner"] #mine {
+  position:absolute;inset:0;display:block;max-width:none;max-height:none;
+  aspect-ratio:auto;object-fit:fill;border:0;border-radius:0;box-shadow:none;
+}
+.game-surface[data-surface="miner"] :is(.field>header,.hud,.dock,.scanner-toggle,.field>footer) {zoom:1}
+.game-surface[data-surface="miner"] .field>header {
+  position:absolute;inset:0;margin:0;min-height:0;display:block;pointer-events:none;z-index:11;
+}
+.game-surface[data-surface="miner"] .wordmark {
+  position:absolute;left:var(--mine-left);top:var(--mine-top);min-height:44px;
+  font-size:calc(28px * var(--mine-ui));gap:calc(8px * var(--mine-ui));
+}
+.game-surface[data-surface="miner"] .wordmark span {display:block;font-size:calc(8px * var(--mine-ui));letter-spacing:1px}
+.game-surface[data-surface="miner"] .game-myelin-badge {
+  position:absolute;left:var(--mine-left);bottom:calc(var(--mine-bottom) + 10px);margin:0;
+  font-size:calc(9px * var(--mine-ui));gap:calc(6px * var(--mine-ui));
+  padding:calc(4px * var(--mine-ui)) calc(7px * var(--mine-ui));letter-spacing:1px;
+}
+.game-surface[data-surface="miner"] .game-myelin-badge img {width:calc(22px * var(--mine-ui));height:calc(22px * var(--mine-ui))}
+.game-surface[data-surface="miner"] #menu {
+  position:absolute;right:var(--mine-right);top:var(--mine-top);width:var(--mine-rail);
+  min-height:calc(44px * var(--mine-ui));padding:calc(10px * var(--mine-ui));
+  font-size:calc(14px * var(--mine-ui));justify-content:center;
+}
+.game-surface[data-surface="miner"] #menu svg {width:calc(18px * var(--mine-ui));height:calc(18px * var(--mine-ui))}
+.game-surface[data-surface="miner"] #menu kbd {display:none}
+.game-surface[data-surface="miner"] .mine-status {
+  position:absolute;left:var(--mine-left);top:50%;transform:translateY(-50%);width:var(--mine-rail);
+  max-height:calc(100% - var(--mine-top) - var(--mine-bottom) - 92px * var(--mine-ui));
+  display:flex;flex-direction:column;gap:calc(12px * var(--mine-ui));overflow:auto;z-index:3;
+  scrollbar-width:thin;
+}
+.game-surface[data-surface="miner"] .hud {
+  position:static;inset:auto;transform:none;display:grid;width:100%;max-width:none;margin:0;
+  grid-template-columns:1fr 1fr;gap:calc(14px * var(--mine-ui)) calc(8px * var(--mine-ui));
+  padding:calc(14px * var(--mine-ui));background:#081521d9;border:1px solid #7da3a52e;
+  border-radius:calc(12px * var(--mine-ui));backdrop-filter:blur(8px);flex:none;
+}
+.game-surface[data-surface="miner"] .hud>div:first-child,
+.game-surface[data-surface="miner"] .hud .quota,
+.game-surface[data-surface="miner"] .hud .contract {grid-column:1/-1;grid-row:auto;display:block;min-width:0}
+.game-surface[data-surface="miner"] .hud .timer {grid-column:1;grid-row:auto;text-align:left;align-self:center}
+.game-surface[data-surface="miner"] .hud #wallet {
+  grid-column:2;grid-row:auto;min-width:0;min-height:calc(48px * var(--mine-ui));
+  padding:calc(6px * var(--mine-ui));text-align:center;align-self:stretch;
+}
+.game-surface[data-surface="miner"] .hud small,
+.game-surface[data-surface="miner"] .hud>div:first-child small,
+.game-surface[data-surface="miner"] .hud #wallet small {
+  font-size:calc(10px * var(--mine-ui));letter-spacing:.08em;line-height:1.4;
+  margin:0 0 calc(4px * var(--mine-ui));max-width:none;
+}
+.game-surface[data-surface="miner"] .hud b {font-size:calc(26px * var(--mine-ui));line-height:1.15;letter-spacing:0}
+.game-surface[data-surface="miner"] .hud>div:first-child b {font-size:calc(20px * var(--mine-ui))}
+.game-surface[data-surface="miner"] .hud em {font-size:calc(14px * var(--mine-ui));margin-left:3px}
+.game-surface[data-surface="miner"] .hud .contract b {font-size:calc(14px * var(--mine-ui));line-height:1.5;display:block}
+.game-surface[data-surface="miner"] .hud #wallet b {font-size:calc(20px * var(--mine-ui))}
+.game-surface[data-surface="miner"] .hud progress {height:calc(4px * var(--mine-ui));margin-top:calc(8px * var(--mine-ui))}
+.game-surface[data-surface="miner"] .scanner-toggle {
+  position:static;inset:auto;display:flex;align-items:center;justify-content:center;flex:none;
+  min-height:calc(44px * var(--mine-ui));width:100%;font-size:calc(11px * var(--mine-ui));
+  padding:calc(6px * var(--mine-ui));gap:calc(7px * var(--mine-ui));
+}
+.game-surface[data-surface="miner"] .scanner-toggle img {width:calc(24px * var(--mine-ui));height:calc(24px * var(--mine-ui))}
+.game-surface[data-surface="miner"] .scanner-toggle kbd {display:none}
+.game-surface[data-surface="miner"] .field>.dock {
+  position:absolute;left:auto;right:var(--mine-right);top:50%;bottom:auto;transform:translateY(-50%);
+  display:flex;flex-direction:column;flex-wrap:nowrap;align-items:stretch;width:var(--mine-rail);max-width:none;
+  gap:calc(14px * var(--mine-ui));margin:0;z-index:3;
+}
+.game-surface[data-surface="miner"] .toolset {
+  display:grid;grid-template-columns:1fr 1fr;gap:calc(8px * var(--mine-ui));
+  width:100%;flex:none;min-width:0;
+}
+.game-surface[data-surface="miner"] .toolset button {
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:calc(4px * var(--mine-ui));
+  min-width:0;min-height:calc(98px * var(--mine-ui));padding:calc(8px * var(--mine-ui)) calc(4px * var(--mine-ui));
+  text-align:center;background:#091727e6;border-color:#53697477;border-radius:calc(10px * var(--mine-ui));
+}
+.game-surface[data-surface="miner"] .toolset button>img {width:calc(36px * var(--mine-ui));height:calc(36px * var(--mine-ui))}
+.game-surface[data-surface="miner"] .toolset strong {font-size:calc(11px * var(--mine-ui));letter-spacing:.06em}
+.game-surface[data-surface="miner"] .toolset small {font-size:calc(10px * var(--mine-ui));margin:0;letter-spacing:0;line-height:1.3}
+.game-surface[data-surface="miner"] .toolset kbd {display:none}
+.game-surface[data-surface="miner"] .field>footer {
+  position:absolute;left:var(--mine-left);right:var(--mine-right);bottom:3px;
+  min-height:0;padding:0;font-size:calc(9px * var(--mine-ui));line-height:1.2;pointer-events:none;
+}
+.game-surface[data-surface="miner"] #hint {display:none}
+.game-surface[data-surface="miner"] #toast {left:50%;transform:translateX(-50%);bottom:calc(var(--mine-bottom) + 12px);max-width:55%;font-size:calc(13px * var(--mine-ui))}
+/* Short landscape screens trade horizontal chrome for a larger mine, while
+   keeping every enabled touch target at least 44 CSS pixels tall. */
+@media (max-height:540px) and (min-width:600px) {
+  .game-surface[data-surface="miner"] .wordmark {font-size:24px;min-height:36px}
+  .game-surface[data-surface="miner"] .wordmark span {font-size:7px}
+  .game-surface[data-surface="miner"] .game-myelin-badge {font-size:8px;bottom:calc(var(--mine-bottom) + 8px);padding:3px 5px}
+  .game-surface[data-surface="miner"] .game-myelin-badge img {width:18px;height:18px}
+  .game-surface[data-surface="miner"] .mine-status {gap:6px;max-height:calc(100% - var(--mine-top) - var(--mine-bottom) - 76px)}
+  .game-surface[data-surface="miner"] .hud {padding:8px;gap:8px 4px;border-radius:9px}
+  .game-surface[data-surface="miner"] .hud>div:first-child b {font-size:15px}
+  .game-surface[data-surface="miner"] .hud b {font-size:22px}
+  .game-surface[data-surface="miner"] .hud em {font-size:11px}
+  .game-surface[data-surface="miner"] .hud .contract b {font-size:11px;line-height:1.35}
+  .game-surface[data-surface="miner"] .hud small,
+  .game-surface[data-surface="miner"] .hud>div:first-child small,
+  .game-surface[data-surface="miner"] .hud #wallet small {font-size:9px;letter-spacing:.03em;margin-bottom:2px}
+  .game-surface[data-surface="miner"] .hud #wallet {padding:4px;min-height:44px}
+  .game-surface[data-surface="miner"] .hud #wallet b {font-size:17px}
+  .game-surface[data-surface="miner"] .hud progress {margin-top:5px;height:3px}
+  .game-surface[data-surface="miner"] .scanner-toggle {font-size:10px}
+  .game-surface[data-surface="miner"] .field>.dock {gap:10px}
+  .game-surface[data-surface="miner"] .toolset {gap:6px}
+  .game-surface[data-surface="miner"] .toolset button {min-height:72px;padding:5px 2px;gap:2px}
+  .game-surface[data-surface="miner"] .toolset button>img {width:26px;height:26px}
+  .game-surface[data-surface="miner"] .toolset strong {font-size:9px;letter-spacing:.03em}
+  .game-surface[data-surface="miner"] .toolset small {font-size:9px}
+}
+/* Portrait remains a supported desktop layout behind the mobile rotate gate. */
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .mine-status {
+  top:calc(var(--mine-top) + 50px);left:var(--mine-left);right:var(--mine-right);width:auto;
+  transform:none;max-height:175px;gap:6px;overflow:auto;
+}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .hud {grid-template-columns:1fr 1fr 1fr;padding:8px;gap:6px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .hud>div:first-child {grid-column:1;grid-row:1}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .quota {grid-column:2;grid-row:1}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .timer {grid-column:3;grid-row:1}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .contract {grid-column:1/3;grid-row:2}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] #wallet {grid-column:3;grid-row:2}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .hud b {font-size:18px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .hud>div:first-child b {font-size:13px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .hud .contract b {font-size:12px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .hud small {font-size:9px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .scanner-toggle {min-height:44px;width:110px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .dock {
+  left:var(--mine-left);right:var(--mine-right);width:auto;top:auto;bottom:calc(var(--mine-bottom) + 16px);transform:none;gap:6px;
+}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .toolset {grid-template-columns:repeat(4,1fr);gap:6px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .toolset button {min-height:72px;padding:4px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .toolset button>img {width:28px;height:28px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .toolset strong {font-size:9px}
+.game-surface[data-surface="miner"] .field[data-mine-layout="portrait"] .game-myelin-badge {display:none}
+@media (prefers-reduced-motion:reduce) {
+  .game-surface[data-surface="miner"] :is(.hud,.toolset button) {backdrop-filter:none}
+}
